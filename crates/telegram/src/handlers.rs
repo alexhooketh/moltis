@@ -394,8 +394,7 @@ pub async fn handle_message_direct(
                         "downloaded document"
                     );
 
-                    let normalized_type = normalize_media_type(&document_file.media_type);
-                    if normalized_type.starts_with("image/") {
+                    if document_file.media_type.starts_with("image/") {
                         // Optimize image documents the same way as photo messages
                         let (final_data, media_type) =
                             match moltis_media::image_ops::optimize_for_llm(
@@ -1577,19 +1576,23 @@ struct DocumentFileInfo {
 }
 
 /// Extract document file info from a message.
+/// The returned `media_type` is already normalized (lowercased, parameters stripped).
 fn extract_document_file(msg: &Message) -> Option<DocumentFileInfo> {
     match &msg.kind {
         MessageKind::Common(common) => match &common.media_kind {
-            MediaKind::Document(d) => Some(DocumentFileInfo {
-                file_id: d.document.file.id.clone(),
-                media_type: d
+            MediaKind::Document(d) => {
+                let raw = d
                     .document
                     .mime_type
                     .as_ref()
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                file_name: d.document.file_name.clone(),
-            }),
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                Some(DocumentFileInfo {
+                    file_id: d.document.file.id.clone(),
+                    media_type: normalize_media_type(&raw),
+                    file_name: d.document.file_name.clone(),
+                })
+            },
             _ => None,
         },
         _ => None,
@@ -1617,10 +1620,11 @@ fn normalize_media_type(media_type: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Check whether a normalized media type is inlineable as text.
+/// Expects input from `normalize_media_type` (lowercased, no parameters).
 fn should_inline_document_text(media_type: &str) -> bool {
-    let media_type = normalize_media_type(media_type);
     matches!(
-        media_type.as_str(),
+        media_type,
         "text/html"
             | "text/plain"
             | "text/markdown"
@@ -1634,37 +1638,49 @@ fn should_inline_document_text(media_type: &str) -> bool {
 
 /// Returns `true` for document types we can actually process (text inlining or
 /// image attachment). Used to skip downloading unsupported files.
+/// Expects input from `normalize_media_type`.
 fn is_supported_document_type(media_type: &str) -> bool {
-    let normalized = normalize_media_type(media_type);
-    normalized.starts_with("image/") || should_inline_document_text(&normalized)
+    media_type.starts_with("image/") || should_inline_document_text(media_type)
 }
 
+/// Expects a normalized `media_type` (from `normalize_media_type`).
 fn extract_text_document_content(data: &[u8], media_type: &str) -> Option<String> {
     if data.is_empty() || !should_inline_document_text(media_type) {
         return None;
     }
 
     let mut truncated = false;
-    let bounded = if data.len() > MAX_INLINE_DOCUMENT_BYTES {
+
+    // Byte-limit: find the largest valid UTF-8 prefix within the cap.
+    let text_slice = if data.len() > MAX_INLINE_DOCUMENT_BYTES {
         truncated = true;
         let slice = &data[..MAX_INLINE_DOCUMENT_BYTES];
         match std::str::from_utf8(slice) {
-            Ok(_) => slice,
-            Err(e) => &slice[..e.valid_up_to()],
+            Ok(s) => s,
+            Err(e) => std::str::from_utf8(&slice[..e.valid_up_to()]).unwrap_or_default(),
         }
     } else {
-        data
+        // Full data — may still contain invalid UTF-8 from non-text bytes.
+        match std::str::from_utf8(data) {
+            Ok(s) => s,
+            Err(_) => return Some(String::from_utf8_lossy(data).trim().to_string()),
+        }
     };
 
-    let mut text = String::from_utf8_lossy(bounded).trim().to_string();
-    if text.is_empty() {
+    let text_slice = text_slice.trim();
+    if text_slice.is_empty() {
         return None;
     }
 
-    if text.chars().count() > MAX_INLINE_DOCUMENT_CHARS {
-        text = text.chars().take(MAX_INLINE_DOCUMENT_CHARS).collect();
+    // Char-limit: find the byte offset of the Nth char boundary in one pass.
+    let mut text = if let Some((byte_idx, _)) =
+        text_slice.char_indices().nth(MAX_INLINE_DOCUMENT_CHARS)
+    {
         truncated = true;
-    }
+        text_slice[..byte_idx].to_string()
+    } else {
+        text_slice.to_string()
+    };
 
     if truncated {
         text.push_str("\n\n[Document content truncated]");
@@ -2239,10 +2255,18 @@ mod tests {
     }
 
     #[test]
-    fn should_inline_with_mime_parameters() {
-        assert!(should_inline_document_text("text/plain; charset=utf-8"));
-        assert!(should_inline_document_text("application/json; charset=utf-8"));
-        assert!(should_inline_document_text("text/html; charset=iso-8859-1"));
+    fn should_inline_after_normalizing_mime_parameters() {
+        // should_inline_document_text expects pre-normalized input;
+        // verify the full normalize → check pipeline works.
+        assert!(should_inline_document_text(&normalize_media_type(
+            "text/plain; charset=utf-8"
+        )));
+        assert!(should_inline_document_text(&normalize_media_type(
+            "application/json; charset=utf-8"
+        )));
+        assert!(should_inline_document_text(&normalize_media_type(
+            "text/html; charset=iso-8859-1"
+        )));
     }
 
     #[test]
@@ -2255,7 +2279,6 @@ mod tests {
     #[test]
     fn is_supported_document_type_checks() {
         assert!(is_supported_document_type("image/png"));
-        assert!(is_supported_document_type("image/jpeg; quality=high"));
         assert!(is_supported_document_type("text/plain"));
         assert!(is_supported_document_type("application/json"));
         assert!(!is_supported_document_type("application/pdf"));
